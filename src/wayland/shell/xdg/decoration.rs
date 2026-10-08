@@ -100,8 +100,17 @@ use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum, backend::GlobalId,
 };
 
-use super::{ToplevelSurface, XdgShellHandler};
-use crate::wayland::{Dispatch2, GlobalData, GlobalDispatch2, shell::xdg::XdgShellSurfaceUserData};
+use super::{ToplevelSurface, XdgShellHandler, XdgToplevelSurfaceData};
+use crate::wayland::{
+    Dispatch2, GlobalData, GlobalDispatch2, compositor::with_states, shell::xdg::XdgShellSurfaceUserData,
+};
+
+/// The highest `zxdg_decoration_manager_v1` version advertised.
+///
+/// Version 2 allows a decoration object to be created for a toplevel that already has a
+/// buffer committed, and makes destroying it switch the toplevel back to client-side
+/// decorations at its next commit (see [`XdgDecorationHandler::decoration_destroyed`]).
+const MANAGER_VERSION: u32 = 2;
 
 /// Delegate type for handling xdg decoration events.
 #[derive(Debug)]
@@ -147,8 +156,10 @@ impl XdgDecorationState {
         let data = XdgDecorationManagerGlobalData {
             filter: Box::new(filter),
         };
-        let global =
-            display.create_global::<D, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(1, data);
+        let global = display.create_global::<D, zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, _>(
+            MANAGER_VERSION,
+            data,
+        );
 
         XdgDecorationState { global }
     }
@@ -169,6 +180,15 @@ pub trait XdgDecorationHandler {
 
     /// Notification the client does not prefer a particular decoration mode on the toplevel.
     fn unset_mode(&mut self, toplevel: ToplevelSurface);
+
+    /// Notification the client destroyed the decoration object of the toplevel.
+    ///
+    /// The protocol says the toplevel switches back to a mode without server-side decorations
+    /// at its next commit, unless a new decoration object is created for it first, in which
+    /// case [`XdgDecorationHandler::new_decoration`] is called again.
+    fn decoration_destroyed(&mut self, toplevel: ToplevelSurface) {
+        let _ = toplevel;
+    }
 }
 
 pub(super) fn send_decoration_configure(
@@ -269,7 +289,7 @@ where
         &self,
         state: &mut D,
         _: &Client,
-        _: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
+        resource: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
         request: zxdg_toplevel_decoration_v1::Request,
         _dh: &DisplayHandle,
         _: &mut DataInit<'_, D>,
@@ -277,11 +297,17 @@ where
         use self::zxdg_toplevel_decoration_v1::Request;
 
         match request {
-            Request::SetMode { mode } => {
-                if let WEnum::Value(mode) = mode {
-                    state.request_mode(self.clone(), mode);
+            Request::SetMode { mode } => match mode {
+                WEnum::Value(mode) => state.request_mode(self.clone(), mode),
+                // Version 1 left an unknown mode undefined, so it is ignored there as before.
+                WEnum::Unknown(value) if resource.version() >= 2 => {
+                    resource.post_error(
+                        zxdg_toplevel_decoration_v1::Error::InvalidMode,
+                        format!("invalid decoration mode {value}"),
+                    );
                 }
-            }
+                WEnum::Unknown(_) => {}
+            },
 
             Request::UnsetMode => {
                 state.unset_mode(self.clone());
@@ -290,6 +316,16 @@ where
             Request::Destroy => {
                 if let Some(data) = self.xdg_toplevel().data::<XdgShellSurfaceUserData>() {
                     data.decoration.lock().unwrap().take();
+                }
+                // A decoration object created for this toplevel later is a new object, and it
+                // is owed its own initial configure.
+                if self.alive() {
+                    with_states(self.wl_surface(), |states| {
+                        if let Some(data) = states.data_map.get::<XdgToplevelSurfaceData>() {
+                            data.lock().unwrap().initial_decoration_configure_sent = false;
+                        }
+                    });
+                    state.decoration_destroyed(self.clone());
                 }
             }
 

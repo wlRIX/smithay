@@ -1495,6 +1495,16 @@ impl X11Wm {
     }
 }
 
+/// Add `window` to a client list unless it is already there. Returns whether it was added, so the
+/// root window property, which mirrors the list, is appended to only when the list changed.
+fn track_client(list: &mut Vec<X11Window>, window: X11Window) -> bool {
+    if list.contains(&window) {
+        return false;
+    }
+    list.push(window);
+    true
+}
+
 fn handle_event<D>(
     loop_handle: &LoopHandle<'_, D>,
     dh: &DisplayHandle,
@@ -1707,22 +1717,29 @@ where
                     drop(_guard);
                     state.mapped_override_redirect_window(xwm_id, surface);
                 } else {
-                    xwm.client_list.push(surface.window_id());
-                    xwm.client_list_stacking.push(surface.window_id());
-                    conn.change_property32(
-                        PropMode::APPEND,
-                        xwm.screen.root,
-                        xwm.atoms._NET_CLIENT_LIST,
-                        AtomEnum::WINDOW,
-                        &[surface.window_id()],
-                    )?;
-                    conn.change_property32(
-                        PropMode::APPEND,
-                        xwm.screen.root,
-                        xwm.atoms._NET_CLIENT_LIST_STACKING,
-                        AtomEnum::WINDOW,
-                        &[surface.window_id()],
-                    )?;
+                    // This is the *frame* being mapped, which also happens when a compositor
+                    // shows a window again with `X11Surface::set_mapped(true)` (after a minimize,
+                    // say). The client stays managed while its frame is unmapped -- it is only
+                    // removed from the lists when the client window itself unmaps -- so it may
+                    // already be listed, and appending again would duplicate it.
+                    if track_client(&mut xwm.client_list, surface.window_id()) {
+                        conn.change_property32(
+                            PropMode::APPEND,
+                            xwm.screen.root,
+                            xwm.atoms._NET_CLIENT_LIST,
+                            AtomEnum::WINDOW,
+                            &[surface.window_id()],
+                        )?;
+                    }
+                    if track_client(&mut xwm.client_list_stacking, surface.window_id()) {
+                        conn.change_property32(
+                            PropMode::APPEND,
+                            xwm.screen.root,
+                            xwm.atoms._NET_CLIENT_LIST_STACKING,
+                            AtomEnum::WINDOW,
+                            &[surface.window_id()],
+                        )?;
+                    }
                     drop(_guard);
                     state.map_window_notify(xwm_id, surface);
                 }
@@ -2861,4 +2878,23 @@ fn atom_from_mime(
             .reply_unchecked()?
             .map(|reply| reply.atom),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::track_client;
+
+    #[test]
+    fn a_window_mapped_again_is_listed_once() {
+        // A compositor hiding and showing a window with `set_mapped` maps its frame again each
+        // time; the client list must not grow with it.
+        let mut list = Vec::new();
+        assert!(track_client(&mut list, 0x300003f));
+        assert!(!track_client(&mut list, 0x300003f));
+        assert!(!track_client(&mut list, 0x300003f));
+        assert_eq!(list, [0x300003f]);
+
+        assert!(track_client(&mut list, 0x4000001));
+        assert_eq!(list, [0x300003f, 0x4000001]);
+    }
 }

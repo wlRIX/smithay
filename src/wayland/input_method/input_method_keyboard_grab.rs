@@ -26,6 +26,12 @@ use crate::{
 pub(crate) struct InputMethodKeyboard {
     pub grab: Option<ZwpInputMethodKeyboardGrabV2>,
     pub text_input_handle: TextInputHandle,
+    /// The serial the keyboard grab was installed with, while the input method holds it.
+    ///
+    /// Another grab can replace this one on the keyboard -- a popup taking the keyboard for a
+    /// menu -- and the input method only finds out when it releases its own object. The serial
+    /// is how the release tells whether the keyboard's grab is still the input method's.
+    pub serial: Option<Serial>,
 }
 
 /// Handle to an input method instance
@@ -100,8 +106,17 @@ impl<D: SeatHandler> fmt::Debug for InputMethodKeyboardUserData<D> {
 
 impl<D: SeatHandler + 'static> Dispatch2<ZwpInputMethodKeyboardGrabV2, D> for InputMethodKeyboardUserData<D> {
     fn destroyed(&self, state: &mut D, _client: ClientId, _object: &ZwpInputMethodKeyboardGrabV2) {
-        self.handle.inner.lock().unwrap().grab = None;
-        self.keyboard_handle.unset_grab(state);
+        let serial = {
+            let mut inner = self.handle.inner.lock().unwrap();
+            inner.grab = None;
+            inner.serial.take()
+        };
+        // Only the input method's own grab. If something has replaced it since -- a popup
+        // grab, most often, which an input method releases its grab under when the popup
+        // takes keyboard focus -- unsetting here would end that grab instead.
+        if serial.is_some_and(|serial| self.keyboard_handle.has_grab(serial)) {
+            self.keyboard_handle.unset_grab(state);
+        }
     }
 
     fn request(

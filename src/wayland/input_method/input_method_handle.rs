@@ -100,6 +100,19 @@ impl InputMethodHandle {
         keyboard.grab.is_some()
     }
 
+    /// The serial of the input method's keyboard grab, while it holds one.
+    ///
+    /// Compare it with [`KeyboardHandle::has_grab`](crate::input::keyboard::KeyboardHandle::has_grab)
+    /// to tell whether the keyboard's current grab is the input method's. A compositor needs that
+    /// to let a popup grab take over from it: an input method holds its grab the whole time a text
+    /// field is focused, so refusing every popup grab while the keyboard is grabbed refuses every
+    /// menu opened from a window that is being typed in.
+    pub fn keyboard_grab_serial(&self) -> Option<crate::utils::Serial> {
+        let inner = self.inner.lock().unwrap();
+        let keyboard = inner.keyboard_grab.inner.lock().unwrap();
+        keyboard.grab.as_ref().and(keyboard.serial)
+    }
+
     pub(crate) fn set_text_input_rectangle<D: SeatHandler + 'static>(
         &self,
         state: &mut D,
@@ -275,11 +288,9 @@ where
             }
             zwp_input_method_v2::Request::GrabKeyboard { keyboard } => {
                 let input_method = self.handle.inner.lock().unwrap();
-                self.keyboard_handle.set_grab(
-                    state,
-                    input_method.keyboard_grab.clone(),
-                    SERIAL_COUNTER.next_serial(),
-                );
+                let serial = SERIAL_COUNTER.next_serial();
+                self.keyboard_handle
+                    .set_grab(state, input_method.keyboard_grab.clone(), serial);
                 let instance = data_init.init(
                     keyboard,
                     InputMethodKeyboardUserData {
@@ -289,6 +300,7 @@ where
                 );
                 let mut keyboard = input_method.keyboard_grab.inner.lock().unwrap();
                 keyboard.grab = Some(instance.clone());
+                keyboard.serial = Some(serial);
                 keyboard.text_input_handle = self.text_input_handle.clone();
                 let guard = self.keyboard_handle.arc.internal.lock().unwrap();
                 instance.repeat_info(guard.repeat_rate, guard.repeat_delay);

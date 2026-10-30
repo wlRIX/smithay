@@ -111,6 +111,9 @@ where
                 // Ensure session is locked.
                 if !self.lock_status.load(Ordering::Relaxed) {
                     lock.post_error(Error::InvalidUnlock, "Session is not locked.");
+                    // Posting the error does not stop this request. Without the return, a client
+                    // whose lock was refused could still unlock the lock somebody else holds.
+                    return;
                 }
 
                 state.lock_state().locked_outputs.clear();

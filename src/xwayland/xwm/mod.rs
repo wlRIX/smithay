@@ -270,6 +270,7 @@ mod atoms {
             _NET_WM_STATE_SKIP_TASKBAR,
             _NET_WM_STATE_SKIP_PAGER,
             _NET_WM_STATE_STICKY,
+            _NET_WM_FULLSCREEN_MONITORS,
             _NET_WM_SYNC_REQUEST,
             _NET_WM_SYNC_REQUEST_COUNTER,
             _NET_SHOWING_DESKTOP,
@@ -435,6 +436,14 @@ pub trait XwmHandler {
     /// Window requests to be unfullscreened.
     fn unfullscreen_request(&mut self, xwm: XwmId, window: X11Surface) {
         let _ = (xwm, window);
+    }
+    /// Window names the monitors it should cover while fullscreen (`_NET_WM_FULLSCREEN_MONITORS`).
+    ///
+    /// `area` is the union of the named monitors, in logical coordinates. This is how Wine moves
+    /// a fullscreen window to another monitor: it sends this instead of a `ConfigureRequest`.
+    /// The same area is available later through [`X11Surface::fullscreen_monitors`].
+    fn fullscreen_monitors_request(&mut self, xwm: XwmId, window: X11Surface, area: Rectangle<i32, Logical>) {
+        let _ = (xwm, window, area);
     }
     /// Window requests to be set as a modal dialog (see [`X11Surface::is_modal`]).
     fn modal_request(&mut self, xwm: XwmId, window: X11Surface) {
@@ -913,6 +922,7 @@ impl X11Wm {
             atoms._NET_WM_STATE_SKIP_PAGER,
             atoms._NET_WM_STATE_STICKY,
             atoms._NET_WM_STATE_DEMANDS_ATTENTION,
+            atoms._NET_WM_FULLSCREEN_MONITORS,
             atoms._NET_ACTIVE_WINDOW,
             atoms._NET_WM_MOVERESIZE,
             atoms._NET_CLIENT_LIST,
@@ -1505,6 +1515,41 @@ fn track_client(list: &mut Vec<X11Window>, window: X11Window) -> bool {
     true
 }
 
+/// The area covered by the Xinerama monitors `[top, bottom, left, right]`, as
+/// `_NET_WM_FULLSCREEN_MONITORS` names them: the top edge of the `top` monitor, the bottom edge
+/// of the `bottom` one, and so on.
+///
+/// Xwayland implements Xinerama on top of RandR, so the indices are those of the RandR monitor
+/// list. `None` if an index is out of range or the list cannot be read.
+fn fullscreen_monitors_area(
+    conn: &RustConnection,
+    root: X11Window,
+    [top, bottom, left, right]: [u32; 4],
+    client_scale: f64,
+) -> Option<Rectangle<i32, Logical>> {
+    let monitors = conn.randr_get_monitors(root, true).ok()?.reply().ok()?.monitors;
+    let monitor = |index: u32| monitors.get(index as usize);
+    let y1 = monitor(top)?.y as i32;
+    let y2 = {
+        let m = monitor(bottom)?;
+        m.y as i32 + m.height as i32
+    };
+    let x1 = monitor(left)?.x as i32;
+    let x2 = {
+        let m = monitor(right)?;
+        m.x as i32 + m.width as i32
+    };
+    if x2 <= x1 || y2 <= y1 {
+        return None;
+    }
+    Some(
+        Rectangle::<i32, Client>::new((x1, y1).into(), (x2 - x1, y2 - y1).into())
+            .to_f64()
+            .to_logical(client_scale)
+            .to_i32_round(),
+    )
+}
+
 fn handle_event<D>(
     loop_handle: &LoopHandle<'_, D>,
     dh: &DisplayHandle,
@@ -1681,6 +1726,29 @@ where
                             let mut state_lock = surface.state.lock().unwrap();
                             for atom in states {
                                 state_lock.net_state.insert(atom);
+                            }
+                        }
+                    }
+
+                    // `_NET_WM_FULLSCREEN_MONITORS` may also be set before mapping, which is how a
+                    // client that opens fullscreen names the monitor it opens on.
+                    if let Ok(reply) = conn
+                        .get_property(
+                            false,
+                            win,
+                            xwm.atoms._NET_WM_FULLSCREEN_MONITORS,
+                            AtomEnum::CARDINAL,
+                            0,
+                            4,
+                        )?
+                        .reply()
+                    {
+                        if let Some(indices) = reply.value32().map(|v| v.collect::<Vec<_>>()) {
+                            if let Ok(indices) = <[u32; 4]>::try_from(indices) {
+                                let client_scale = xwm.client_scale.load(Ordering::Acquire);
+                                let area =
+                                    fullscreen_monitors_area(&conn, xwm.screen.root, indices, client_scale);
+                                surface.state.lock().unwrap().fullscreen_monitors = area;
                             }
                         }
                     }
@@ -2644,6 +2712,29 @@ where
                                 }
                             }
                             _ => {}
+                        }
+                    }
+                }
+                x if x == xwm.atoms._NET_WM_FULLSCREEN_MONITORS => {
+                    // data: top, bottom, left, right (Xinerama monitor indices), source indication.
+                    let data = msg.data.as_data32();
+                    let indices = [data[0], data[1], data[2], data[3]];
+                    if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == msg.window).cloned() {
+                        // Recording the property is the window manager's job (EWMH).
+                        conn.change_property32(
+                            PropMode::REPLACE,
+                            msg.window,
+                            xwm.atoms._NET_WM_FULLSCREEN_MONITORS,
+                            AtomEnum::CARDINAL,
+                            &indices,
+                        )?;
+                        let client_scale = xwm.client_scale.load(Ordering::Acquire);
+                        let area = fullscreen_monitors_area(&conn, xwm.screen.root, indices, client_scale);
+                        debug!(window = ?msg.window, ?indices, ?area, "X11: _NET_WM_FULLSCREEN_MONITORS request");
+                        surface.state.lock().unwrap().fullscreen_monitors = area;
+                        if let Some(area) = area {
+                            drop(_guard);
+                            state.fullscreen_monitors_request(xwm_id, surface, area);
                         }
                     }
                 }

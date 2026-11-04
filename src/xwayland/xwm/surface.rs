@@ -160,6 +160,7 @@ pub(crate) struct SharedSurfaceState {
     normal_hints: Option<WmSizeHints>,
     transient_for: Option<X11Window>,
     pub(super) net_state: HashSet<Atom>,
+    pub(super) fullscreen_monitors: Option<Rectangle<i32, Logical>>,
     motif_hints: MwmHints,
     window_type: Vec<Atom>,
     pub(crate) opacity: Option<u32>,
@@ -365,6 +366,7 @@ impl X11Surface {
                 normal_hints: None,
                 transient_for: None,
                 net_state: HashSet::new(),
+                fullscreen_monitors: None,
                 motif_hints: MwmHints::default(),
                 window_type: Vec::new(),
                 opacity: None,
@@ -1188,6 +1190,12 @@ impl X11Surface {
         let state = self.state.lock().unwrap();
         state.net_state.contains(&self.atoms._NET_WM_STATE_MAXIMIZED_HORZ)
             && state.net_state.contains(&self.atoms._NET_WM_STATE_MAXIMIZED_VERT)
+    }
+
+    /// The area the window asked to cover while fullscreen, through `_NET_WM_FULLSCREEN_MONITORS`
+    /// (set before mapping, or requested since), in logical coordinates.
+    pub fn fullscreen_monitors(&self) -> Option<Rectangle<i32, Logical>> {
+        self.state.lock().unwrap().fullscreen_monitors
     }
 
     /// Returns if the window is in the fullscreen state
